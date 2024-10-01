@@ -26,7 +26,6 @@ from uuid import uuid4
 
 import pendulum
 import pytest
-from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.declarative import DeclarativeMeta
 
@@ -51,6 +50,36 @@ from airflow.utils.session import create_session
 from tests.test_utils.db import clear_db_assets, clear_db_dags, clear_db_runs, drop_tables_with_prefix
 
 pytestmark = [pytest.mark.db_test, pytest.mark.skip_if_database_isolation_mode]
+
+SQL_TASK_INSTANCE_SELECT = "SELECT base.* \nFROM task_instance AS base \nWHERE base.start_date < ?"
+SQL_TASK_INSTANCE_DELETE = "DELETE FROM task_instance AS base WHERE base.start_date < :start_date_1"
+SQL_DAG_RUN_SELECT = (
+    "SELECT base.* \n"
+    "FROM dag_run AS base "
+    "LEFT OUTER JOIN ("
+    "SELECT dag_id, max(dag_run.start_date) AS max_date_per_group \n"
+    "FROM dag_run \n"
+    "WHERE external_trigger = 0 "
+    "GROUP BY dag_id"
+    ") AS latest ON base.dag_id = latest.dag_id "
+    "AND base.start_date = max_date_per_group \n"
+    "WHERE base.start_date < ? "
+    "AND max_date_per_group IS NULL"
+)
+SQL_DAG_RUN_DELETE = (
+    "DELETE FROM dag_run AS base "
+    "WHERE NOT (EXISTS ("
+    "SELECT latest.dag_id, "
+    "latest.max_date_per_group \n"
+    "FROM ("
+    "SELECT dag_id, max(dag_run.start_date) AS max_date_per_group \n"
+    "FROM dag_run \n"
+    "WHERE external_trigger = false GROUP BY dag_id"
+    ") AS latest \n"
+    "WHERE base.dag_id = latest.dag_id AND base.start_date = max_date_per_group"
+    ")) "
+    "AND base.start_date < :start_date_1"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -177,17 +206,80 @@ class TestDBCleanup:
             do_delete.assert_called()
 
     @pytest.mark.parametrize(
-        "table_name, date_add_kwargs, expected_to_delete, external_trigger",
         [
-            pytest.param("task_instance", dict(days=0), 0, False, id="beginning"),
-            pytest.param("task_instance", dict(days=4), 4, False, id="middle"),
-            pytest.param("task_instance", dict(days=9), 9, False, id="end_exactly"),
-            pytest.param("task_instance", dict(days=9, microseconds=1), 10, False, id="beyond_end"),
-            pytest.param("dag_run", dict(days=9, microseconds=1), 9, False, id="beyond_end_dr"),
-            pytest.param("dag_run", dict(days=9, microseconds=1), 10, True, id="beyond_end_dr_external"),
+            "table_name",
+            "date_add_kwargs",
+            "expected_to_delete",
+            "external_trigger",
+            "expected_select",
+            "expected_delete",
+        ],
+        [
+            pytest.param(
+                "task_instance",
+                dict(days=0),
+                0,
+                False,
+                SQL_TASK_INSTANCE_SELECT,
+                SQL_TASK_INSTANCE_DELETE,
+                id="beginning",
+            ),
+            pytest.param(
+                "task_instance",
+                dict(days=4),
+                4,
+                False,
+                SQL_TASK_INSTANCE_SELECT,
+                SQL_TASK_INSTANCE_DELETE,
+                id="middle",
+            ),
+            pytest.param(
+                "task_instance",
+                dict(days=9),
+                9,
+                False,
+                SQL_TASK_INSTANCE_SELECT,
+                SQL_TASK_INSTANCE_DELETE,
+                id="end_exactly",
+            ),
+            pytest.param(
+                "task_instance",
+                dict(days=9, microseconds=1),
+                10,
+                False,
+                SQL_TASK_INSTANCE_SELECT,
+                SQL_TASK_INSTANCE_DELETE,
+                id="beyond_end",
+            ),
+            pytest.param(
+                "dag_run",
+                dict(days=9, microseconds=1),
+                9,
+                False,
+                SQL_DAG_RUN_SELECT,
+                SQL_DAG_RUN_DELETE,
+                id="beyond_end_dr",
+            ),
+            pytest.param(
+                "dag_run",
+                dict(days=9, microseconds=1),
+                10,
+                True,
+                SQL_DAG_RUN_SELECT,
+                SQL_DAG_RUN_DELETE,
+                id="beyond_end_dr_external",
+            ),
         ],
     )
-    def test__build_query(self, table_name, date_add_kwargs, expected_to_delete, external_trigger):
+    def test__build_query(
+        self,
+        table_name,
+        date_add_kwargs,
+        expected_to_delete,
+        external_trigger,
+        expected_select,
+        expected_delete,
+    ):
         """
         Verify that ``_build_query`` produces a query that would delete the right
         task instance records depending on the value of ``clean_before_timestamp``.
@@ -204,45 +296,20 @@ class TestDBCleanup:
             num_tis=10,
             external_trigger=external_trigger,
         )
-        target_table_name = "_airflow_temp_table_name"
+        tmp_table_name = "_airflow_temp_table_name"
         with create_session() as session:
             clean_before_date = base_date.add(**date_add_kwargs)
-            query, delete_stmt = _build_query(
+            select_sql, delete_sql = _build_query(
                 **config_dict[table_name].__dict__,
                 clean_before_timestamp=clean_before_date,
                 session=session,
             )
-            stmt = CreateTableAs(target_table_name, query.selectable)
+            stmt = CreateTableAs(tmp_table_name, select_sql.selectable)
             session.execute(stmt)
-            res = session.execute(text(f"SELECT COUNT(1) FROM {target_table_name}"))
-            for row in res:
-                assert row[0] == expected_to_delete
-
-            # validate the query and delete statements
-            if table_name == "task_instance":
-                assert str(query).replace("\n", "") == (
-                    "SELECT base.* FROM task_instance AS base WHERE base.start_date < ?"
-                )
-                assert str(delete_stmt).replace("\n", "") == (
-                    "DELETE FROM task_instance AS base WHERE base.start_date < :start_date_1"
-                )
-            if table_name == "dag_run":
-                assert str(query).replace("\n", "") == (
-                    "SELECT base.*"
-                    " FROM dag_run AS base LEFT OUTER JOIN (SELECT dag_id, max(dag_run.start_date) AS max_date_per_group"
-                    " FROM dag_run"
-                    " WHERE external_trigger = 0 GROUP BY dag_id) AS latest "
-                    "ON base.dag_id = latest.dag_id AND base.start_date = max_date_per_group"
-                    " WHERE base.start_date < ? AND max_date_per_group IS NULL"
-                )
-                assert str(delete_stmt).replace("\n", "") == (
-                    "DELETE FROM dag_run AS base WHERE NOT (EXISTS (SELECT latest.dag_id, latest.max_date_per_group"
-                    " FROM (SELECT dag_id, max(dag_run.start_date) AS max_date_per_group"
-                    " FROM dag_run"
-                    " WHERE external_trigger = false GROUP BY dag_id) AS latest"
-                    " WHERE base.dag_id = latest.dag_id AND base.start_date = max_date_per_group)) "
-                    "AND base.start_date < :start_date_1"
-                )
+            actual_count = session.scalar(f"SELECT COUNT(1) FROM {tmp_table_name}")
+            assert actual_count == expected_to_delete
+            assert str(select_sql) == expected_select
+            assert str(delete_sql) == expected_delete
 
     @pytest.mark.parametrize(
         "table_name, date_add_kwargs, expected_to_delete, external_trigger",
