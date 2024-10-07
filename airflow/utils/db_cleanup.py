@@ -102,7 +102,7 @@ config_list: list[_TableConfig] = [
     _TableConfig(table_name="dag", recency_column_name="last_parsed_time"),
     _TableConfig(
         table_name="dag_run",
-        recency_column_name="start_date",
+        recency_column_name="logical_date",
         extra_columns=["dag_id", "external_trigger"],
         keep_last=True,
         keep_last_filters=[column("external_trigger") == false()],
