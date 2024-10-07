@@ -554,6 +554,7 @@ def create_tis(base_date, num_tis, external_trigger=False):
                 run_id=f"abc_{num}",
                 run_type="none",
                 start_date=start_date,
+                execution_date=start_date,
                 external_trigger=external_trigger,
             )
             ti = TaskInstance(
